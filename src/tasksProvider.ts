@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as JSONC from 'jsonc-parser';
 import { AdditionalTasks } from './additionalTasks';
+import { TaskViewConfig, ViewHierarchyResult, extractViewConfig, buildViewHierarchy, GroupItem } from './taskView';
 
 interface TaskStatus {
     isActive: boolean;
@@ -21,6 +22,7 @@ interface TaskConfigDefinition {
     taskName?: string;
     icon?: { id?: string; color?: string };
     hide?: boolean;
+    view?: { identifier?: string; parentLabel?: string; parentId?: string };
 }
 
 /**
@@ -86,6 +88,7 @@ export class TasksProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     private taskIconMap: Map<string, CustomIcon> = new Map();
     private taskLocationMap: Map<string, { filePath: string; line: number }> = new Map();
     private hiddenTaskSet: Set<string> = new Set();
+    private taskViewMap: Map<string, TaskViewConfig> = new Map();
 
     constructor(
         private readonly workspaceState: vscode.Memento,
@@ -137,6 +140,7 @@ export class TasksProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
             this.taskIconMap.clear();
             this.taskLocationMap.clear();
             this.hiddenTaskSet.clear();
+            this.taskViewMap.clear();
 
             // Icons and hide flags come from the configuration model: VS Code itself
             // resolves user tasks.json, the "tasks" section of settings.json and
@@ -220,6 +224,12 @@ export class TasksProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
             if (taskDef.hide === true) {
                 this.hiddenTaskSet.add(mapKey);
                 this.hiddenTaskSet.add(label);
+            }
+
+            const view = extractViewConfig(taskDef.view);
+            if (view) {
+                this.taskViewMap.set(mapKey, view);
+                this.taskViewMap.set(label, view);
             }
         }
     }
@@ -429,41 +439,84 @@ export class TasksProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
             this.ensureCustomIconsLoaded();
         }
 
+        const tasks = await this.getConfiguredTasks();
+        const { taskByKey, hierarchy } = this.buildHierarchyContext(tasks);
+
+        // A "view" group node: show the tasks declared with this parentLabel
+        if (element instanceof GroupItem) {
+            return this.resolveViewChildren(hierarchy.childrenOfGroup.get(element.identifier), taskByKey, hierarchy);
+        }
+
+        // A task that other tasks nest under via parentId
+        if (element instanceof TaskItem) {
+            const key = element.task ? this.getTaskKey(element.task) : undefined;
+            return key ? this.resolveViewChildren(hierarchy.childrenOfTask.get(key), taskByKey, hierarchy) : [];
+        }
+
         const folderCount = vscode.workspace.workspaceFolders.length;
         const forceFlat = folderCount <= 1; // Always flat when only one workspace folder
         const isFlat = forceFlat || this.isFlatListEnabled();
-        const tasks = await this.getConfiguredTasks();
+
+        // Tasks nested under a view group/task are not shown at the root/folder level
+        const rootTasks = tasks.filter(task => !hierarchy.consumedKeys.has(this.getTaskKey(task)));
+        const viewGroupItems = hierarchy.groupLabels.map(label => new GroupItem(label));
 
         // Flat list mode
         if (isFlat) {
-            return tasks.map(task => this.createTaskItem(task));
+            return [
+                ...rootTasks.map(task => this.createTaskItem(task, hierarchy)),
+                ...viewGroupItems
+            ];
         }
 
         // Grouped mode
         if (!element) {
-            const workspaceScopedTasks = tasks.filter(task => typeof task.scope === 'number');
+            const workspaceScopedTasks = rootTasks.filter(task => typeof task.scope === 'number');
             const foldersWithTasks = vscode.workspace.workspaceFolders.filter(folder =>
-                tasks.some(task => {
+                rootTasks.some(task => {
                     const scope = task.scope as vscode.WorkspaceFolder;
                     return scope?.name === folder.name;
                 })
             );
             return [
-                ...workspaceScopedTasks.map(task => this.createTaskItem(task)),
+                ...workspaceScopedTasks.map(task => this.createTaskItem(task, hierarchy)),
+                ...viewGroupItems,
                 ...foldersWithTasks.map(folder => new WorkspaceItem(folder)),
             ];
         }
 
         if (element instanceof WorkspaceItem) {
             const folder = element.folder;
-            const folderTasks = tasks.filter(task => {
+            const folderTasks = rootTasks.filter(task => {
                 const scope = (task as any).scope as any;
                 return scope && typeof scope === 'object' && 'name' in scope && scope.name === folder.name;
             });
-            return folderTasks.map(task => this.createTaskItem(task));
+            return folderTasks.map(task => this.createTaskItem(task, hierarchy));
         }
 
         return [];
+    }
+
+    /** Resolves `view`-declared task keys back into vscode.Task-backed TreeItems, in declaration order. */
+    private resolveViewChildren(
+        keys: string[] | undefined,
+        taskByKey: Map<string, vscode.Task>,
+        hierarchy: ViewHierarchyResult
+    ): vscode.TreeItem[] {
+        if (!keys) {
+            return [];
+        }
+        return keys
+            .map(key => taskByKey.get(key))
+            .filter((task): task is vscode.Task => !!task)
+            .map(task => this.createTaskItem(task, hierarchy));
+    }
+
+    /** Builds the `view.parentLabel`/`view.parentId` hierarchy for the current task list. */
+    private buildHierarchyContext(tasks: vscode.Task[]): { taskByKey: Map<string, vscode.Task>; hierarchy: ViewHierarchyResult } {
+        const taskByKey = new Map(tasks.map(task => [this.getTaskKey(task), task]));
+        const entries = tasks.map(task => ({ key: this.getTaskKey(task), view: this.getTaskView(task) }));
+        return { taskByKey, hierarchy: buildViewHierarchy(entries) };
     }
 
     private isFlatListEnabled(): boolean {
@@ -511,7 +564,12 @@ export class TasksProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
         return this.hiddenTaskSet.has(key) || this.hiddenTaskSet.has(task.name);
     }
 
-    private createTaskItem(task: vscode.Task): TaskItem {
+    private getTaskView(task: vscode.Task): TaskViewConfig | undefined {
+        const key = this.getTaskKey(task);
+        return this.taskViewMap.get(key) ?? this.taskViewMap.get(task.name);
+    }
+
+    private createTaskItem(task: vscode.Task, hierarchy?: ViewHierarchyResult): TaskItem {
         const key = this.getTaskKey(task);
         const taskStatus = this.taskStatusMap.get(key) ?? this.taskStatusMap.get(task.name);
 
@@ -548,7 +606,9 @@ export class TasksProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
         const taskItem = new TaskItem(
             displayLabel,
             additional?.definition.type ?? task.definition.type,
-            vscode.TreeItemCollapsibleState.None,
+            hierarchy?.parentKeysWithChildren.has(key)
+                ? vscode.TreeItemCollapsibleState.Collapsed
+                : vscode.TreeItemCollapsibleState.None,
             {
                 command: 'fast-tasks.runTask',
                 title: '',
